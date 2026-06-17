@@ -6,7 +6,7 @@ import makeWASocket, {
     Browsers
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
-import qrcode from 'qrcode-terminal';
+import qrcode from 'qrcode';
 import { config } from '../config/index.js';
 import {
     cleanJid,
@@ -50,7 +50,8 @@ export class WhatsAppService {
         this.botName = CONSTANTS.BOT_NAME;
         this.messageQueue = [];
         this.isProcessingQueue = false;
-        this.saveCredsFn = null; // Store saveCreds function
+        this.saveCredsFn = null;
+        this.qrCallback = null; // Add QR callback
         
         // Newsletter configuration
         this.newsletterConfig = {
@@ -59,11 +60,14 @@ export class WhatsAppService {
             enabled: true
         };
         
-        // Bind methods to avoid recreating functions
+        // Bind methods
         this.handleConnectionUpdate = this.handleConnectionUpdate.bind(this);
         this.handleMessagesUpsert = this.handleMessagesUpsert.bind(this);
-        // Remove this line - handleCredsUpdate no longer exists
-        // this.handleCredsUpdate = this.handleCredsUpdate.bind(this);
+    }
+
+    // Method to set QR callback
+    setQRCallback(callback) {
+        this.qrCallback = callback;
     }
 
     // ============ Connection Management ============
@@ -72,7 +76,6 @@ export class WhatsAppService {
             const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
             const { version } = await fetchLatestBaileysVersion();
             
-            // Store saveCreds function
             this.saveCredsFn = saveCreds;
             
             console.log(`📱 Using WhatsApp Web v${version.join('.')}`);
@@ -81,13 +84,12 @@ export class WhatsAppService {
                 version,
                 auth: state,
                 logger: pino({ level: 'silent' }),
-                printQRInTerminal: false,
+                printQRInTerminal: false, // Disable terminal QR
                 browser: Browsers.macOS('Chrome'),
                 syncFullHistory: false,
                 markOnlineOnConnect: false,
-                shouldSyncHistory: () => false, // Prevent unnecessary history sync
+                shouldSyncHistory: () => false,
                 patchMessageBeforeSending: (message) => {
-                    // Optimize message sending by removing unnecessary fields
                     const { message: msg, ...rest } = message;
                     return rest;
                 }
@@ -95,7 +97,6 @@ export class WhatsAppService {
 
             this.sock = sock;
             
-            // Fix: Pass saveCreds as callback, not call it directly
             sock.ev.on('creds.update', () => {
                 if (this.saveCredsFn) {
                     this.saveCredsFn();
@@ -105,7 +106,6 @@ export class WhatsAppService {
             sock.ev.on('connection.update', this.handleConnectionUpdate);
             sock.ev.on('messages.upsert', this.handleMessagesUpsert);
 
-            // Clean up old listeners on reconnect
             sock.ev.on('close', () => {
                 sock.ev.removeAllListeners();
             });
@@ -117,12 +117,46 @@ export class WhatsAppService {
         }
     }
 
-    handleConnectionUpdate(update) {
+    async handleConnectionUpdate(update) {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('\n📱 Scan QR Code:');
-            qrcode.generate(qr, { small: true });
+            console.log('\n📱 QR Code received. Generating base64...');
+            
+            // Generate base64 QR code
+            try {
+                const qrBase64 = await this.generateQRBase64(qr);
+                
+                // Create JSON response
+                const qrResponse = {
+                    status: 'qr_required',
+                    message: 'Scan QR code to login',
+                    qr: {
+                        base64: qrBase64,
+                        data: qr
+                    },
+                    timestamp: new Date().toISOString()
+                };
+
+                console.log('✅ QR Code generated successfully');
+                
+                // If callback is set, send the QR
+                if (this.qrCallback) {
+                    this.qrCallback(qrResponse);
+                } else {
+                    // If no callback, log the JSON (excluding full base64 for readability)
+                    console.log(JSON.stringify({
+                        ...qrResponse,
+                        qr: {
+                            ...qrResponse.qr,
+                            base64: qrBase64.substring(0, 100) + '...' // Truncated for console
+                        }
+                    }, null, 2));
+                }
+
+            } catch (error) {
+                console.error('❌ Failed to generate QR base64:', error);
+            }
         }
 
         if (connection === 'close') {
@@ -153,6 +187,28 @@ export class WhatsAppService {
         }
     }
 
+    // ============ QR Code Generation ============
+    async generateQRBase64(qrData) {
+        try {
+            // Generate QR as data URL
+            const qrImage = await qrcode.toDataURL(qrData, {
+                type: 'image/png',
+                margin: 2,
+                scale: 10,
+                color: {
+                    dark: '#000000',
+                    light: '#ffffff'
+                }
+            });
+            
+            // Extract base64 part (remove data:image/png;base64, prefix)
+            return qrImage.replace(/^data:image\/png;base64,/, '');
+        } catch (error) {
+            console.error('❌ Error generating QR base64:', error);
+            throw error;
+        }
+    }
+
     // ============ Status Management ============
     async setOfflineStatus() {
         try {
@@ -160,7 +216,7 @@ export class WhatsAppService {
                 await this.sock.sendPresenceUpdate('unavailable');
             }
         } catch (error) {
-            // Silent fail - no need to log every failure
+            // Silent fail
         }
     }
 
@@ -178,7 +234,6 @@ export class WhatsAppService {
     createForwardedMessage(text, messageId) {
         const content = { text };
         
-        // Only add newsletter context if enabled and configured
         if (this.newsletterConfig.enabled && 
             this.newsletterConfig.newsletterJid && 
             this.newsletterConfig.newsletterJid !== 'YOUR_CHANNEL_JID@newsletter') {
@@ -208,12 +263,10 @@ export class WhatsAppService {
 
             const msg = messages[0];
             
-            // Quick validation checks
             if (msg.key.fromMe || !msg.message) return;
             
             const remoteJid = msg.key.remoteJid;
             
-            // Skip broadcasts and status messages
             if (isBroadcastJid(remoteJid) || isStatusMessage(msg)) return;
 
             const textContent = getMessageText(msg.message);
@@ -221,21 +274,18 @@ export class WhatsAppService {
 
             const messageId = msg.key.id;
             
-            // Duplicate message check with cleanup
             if (this.processedMessages.has(messageId)) {
                 return;
             }
             
             this.processedMessages.add(messageId);
             
-            // Optimize cache cleanup
             if (this.processedMessages.size > CONSTANTS.MESSAGE_CACHE_LIMIT) {
                 this.cleanupMessageCache();
             }
 
             this.lastActivity = Date.now();
             
-            // Add to queue for processing
             this.enqueueMessage(msg, remoteJid, textContent);
 
         } catch (err) {
@@ -254,7 +304,6 @@ export class WhatsAppService {
         const sender = getSenderJid(msg);
         const isGroup = isGroupJid(remoteJid);
         
-        // Check authorization early
         if (!isGroup && !this.shouldReplyToSender(remoteJid)) {
             console.log(`🔇 Personal message from ${sender} ignored (not authorized)`);
             this.setOfflineStatus().catch(() => {});
@@ -270,7 +319,6 @@ export class WhatsAppService {
             timestamp: Date.now()
         });
 
-        // Process queue if not already processing
         if (!this.isProcessingQueue) {
             this.processQueue();
         }
@@ -285,7 +333,6 @@ export class WhatsAppService {
 
         try {
             while (this.messageQueue.length > 0) {
-                // Process messages in batches
                 const batchSize = Math.min(this.messageQueue.length, 5);
                 const batch = this.messageQueue.splice(0, batchSize);
 
@@ -293,7 +340,6 @@ export class WhatsAppService {
                     await this.processMessage(item);
                 }));
 
-                // Small delay between batches
                 if (this.messageQueue.length > 0) {
                     await new Promise(resolve => setTimeout(resolve, 100));
                 }
@@ -303,7 +349,6 @@ export class WhatsAppService {
         } finally {
             this.isProcessingQueue = false;
             
-            // Check if new messages were added while processing
             if (this.messageQueue.length > 0) {
                 this.processQueue();
             }
@@ -318,11 +363,9 @@ export class WhatsAppService {
         console.log(`💬 Processing: "${textContent}" from ${senderName} (${phoneNumber})`);
 
         try {
-            // Check for special commands
             const hasDPKeyword = this.hasKeyword(textContent, CONSTANTS.DP_KEYWORDS);
             const hasFileKeyword = this.hasKeyword(textContent, CONSTANTS.FILE_KEYWORDS);
 
-            // Send status messages if needed
             if (hasDPKeyword || hasFileKeyword) {
                 const statusMessage = hasDPKeyword ? 
                     "⏳ Please wait, I'm fetching the DP..." : 
@@ -330,13 +373,10 @@ export class WhatsAppService {
                 await this.sock.sendMessage(remoteJid, { text: statusMessage }, { quoted: msg });
             }
 
-            // Build context message
             const contextMessage = this.buildContextMessage(textContent, senderName, phoneNumber, isGroup, msg);
 
-            // Generate response
             const response = await generateAIResponse(contextMessage, this.sock, remoteJid);
 
-            // Handle response
             if (response === null) {
                 console.log(`✅ File sent successfully to ${senderName} (${phoneNumber})`);
                 return;
@@ -435,7 +475,6 @@ export class WhatsAppService {
         }
     }
 
-    // Get connection status
     getConnectionStatus() {
         return {
             isConnected: this.isConnected,
